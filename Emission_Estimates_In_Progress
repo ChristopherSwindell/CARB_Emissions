@@ -1,0 +1,442 @@
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+import xarray as xr
+import os
+import geopandas as gpd
+import matplotlib.pyplot as plt
+from shapely.geometry import Point
+
+class GriddedEmissionsModel:
+    def __init__(self, data_path, grid_path):
+        """Initialize the emissions model with data and grid paths."""
+        self.data_path = data_path
+        self.grid_path = grid_path
+        self.saprc99_species = [
+            'CO2', 'CO', 'NO', 'NO2', 'SO2', 'NH3', 'CH4', 'NMOC',
+            'ACET', 'ALK1', 'ALK2', 'ALK3', 'ALK4', 'ALK5',
+            'ARO1', 'ARO2', 'BALD', 'CCHO', 'CCO_OH', 'ETHENE',
+            'HCHO', 'HCN', 'HCOOH', 'HONO', 'ISOPRENE', 'MEK',
+            'MEOH', 'METHACRO', 'MGLY', 'MVK', 'OLE1', 'OLE2',
+            'PHEN', 'PROD2', 'RCHO', 'RNO3', 'TRP1',
+            'OC', 'BC', 'PM25', 'PM10'
+        ]
+        self.load_data()
+
+    def load_data(self):
+        """Load all required data files including the grid shapefile."""
+        # Load grid data
+        grid_file = os.path.join(self.grid_path, 'Mexicali_1k_grid.shp')
+        self.grid = gpd.read_file(grid_file)
+
+        # Keep Grid_ID as integer
+        self.grid['Grid_ID'] = self.grid['Grid_ID'].astype(int)
+
+        # Store grid information
+        self.total_cells = len(self.grid)
+        self.min_grid_id = self.grid['Grid_ID'].min()
+        self.max_grid_id = self.grid['Grid_ID'].max()
+
+        print(f"\nLoaded grid shapefile with {self.total_cells} cells")
+        print(f"Grid_ID range: {self.min_grid_id} to {self.max_grid_id}")
+
+        # Load existing data files
+        finn_path = os.path.join(self.data_path, 'FINN_Estimates.csv')
+        self.finn_data = pd.read_csv(finn_path, thousands=',')
+        self.finn_data.set_index('Pollutant', inplace=True)
+
+        characteristics_path = os.path.join(self.data_path, 'Crop_Residue_Characteristics.xlsx')
+        self.characteristics_data = pd.read_excel(characteristics_path)
+
+        properties_path = os.path.join(self.data_path, 'Residue_Properties.csv')
+        self.properties_data = pd.read_csv(properties_path)
+
+        fofem_path = os.path.join(self.data_path, 'FOFEM_Short_List_Estimates.csv')
+        fofem_data = pd.read_csv(fofem_path)
+        self.valid_crops = sorted(fofem_data['Crop'].unique().tolist())
+
+    def display_grid(self):
+        """Display the grid shapefile with Grid_ID labels."""
+        fig, ax = plt.subplots(figsize=(15, 15))
+        self.grid.plot(ax=ax, alpha=0.5)
+
+        # Add Grid_ID labels at centroid of each cell
+        for idx, row in self.grid.iterrows():
+            centroid = row.geometry.centroid
+            ax.annotate(text=row['Grid_ID'], xy=(centroid.x, centroid.y),
+                        horizontalalignment='center', fontsize=8)
+
+        plt.title('Mexicali 1km Grid')
+        plt.xlabel('Longitude')
+        plt.ylabel('Latitude')
+        plt.show()
+
+    def get_user_inputs(self):
+        """Get user inputs for grid cells, crops, and burn times."""
+        print("\nDisplaying grid map for reference...")
+        self.display_grid()
+
+        # Display available Grid_IDs
+        print("\nAvailable Grid_IDs:")
+        grid_ids = sorted(self.grid['Grid_ID'].unique())
+        for i in range(0, len(grid_ids), 5):  # Show 5 IDs per line
+            print(", ".join(grid_ids[i:i + 5]))
+
+        grid_selections = []
+        while True:
+            print("\nEnter burn information (or 'done' to finish):")
+            grid_id = input("Grid ID: ")
+            if grid_id.lower() == 'done':
+                break
+
+            # Convert input to string for consistent comparison
+            grid_id = str(grid_id)
+
+            if not self.grid['Grid_ID'].isin([grid_id]).any():
+                print(f"Invalid Grid ID: {grid_id}")
+                print("Please select from the available Grid_IDs shown above.")
+                continue
+
+            # Get crop selection
+            print("\nAvailable crops:")
+            for i, crop in enumerate(self.valid_crops, 1):
+                print(f"{i}. {crop}")
+            print("15. Custom crop type")
+
+            try:
+                crop_idx = int(input("Enter crop number: "))
+                if crop_idx == 15:
+                    custom_name = input("Enter custom crop name: ")
+                    crop = f"Custom_{custom_name}"  # Will use wheat characteristics
+                else:
+                    crop_idx -= 1  # Adjust index for 0-based list
+                    if not (0 <= crop_idx < len(self.valid_crops)):
+                        print("Invalid crop selection.")
+                        continue
+                    crop = self.valid_crops[crop_idx]
+            except ValueError:
+                print("Please enter a valid number.")
+                continue
+
+            # Get date and time range
+            try:
+                date_str = input("Enter burn date (YYYY-MM-DD): ")
+                start_hour = int(input("Enter start hour (0-23): "))
+                end_hour = int(input("Enter end hour (0-23): "))
+
+                if not (0 <= start_hour <= 23 and 0 <= end_hour <= 23):
+                    print("Invalid hour. Please enter 0-23.")
+                    continue
+                if end_hour < start_hour:
+                    print("End hour must be after start hour.")
+                    continue
+
+                # Calculate number of hours and create datetimes
+                burn_datetimes = []
+                hours_in_range = end_hour - start_hour  # Don't add 1, exclusive of end hour
+                if hours_in_range < 1:
+                    print("End hour must be at least one hour after start hour.")
+                    continue
+
+                for hour in range(start_hour, end_hour):  # Exclude end hour
+                    burn_datetime = datetime.strptime(f"{date_str} {hour:02d}:00", '%Y-%m-%d %H:%M')
+                    burn_datetimes.append(burn_datetime)
+
+            except ValueError:
+                print("Invalid date/time format.")
+                continue
+
+            # Get burn area (assuming not full cell)
+            try:
+                area = float(input("Enter burn area in square meters (max 1,000,000): "))
+                if not (0 < area <= 1_000_000):  # 1 km² = 1,000,000 m²
+                    print("Invalid area. Must be between 0 and 1,000,000 m².")
+                    continue
+            except ValueError:
+                print("Please enter a valid number.")
+                continue
+
+            # Calculate area per hour for uniform distribution
+            hours_count = len(burn_datetimes)
+            area_per_hour = area / hours_count
+
+            # Add an entry for each hour in the time range
+            for burn_datetime in burn_datetimes:
+                grid_selections.append({
+                    'grid_id': grid_id,
+                    'crop': crop,
+                    'datetime': burn_datetime,
+                    'area': area_per_hour
+                })
+
+        return grid_selections
+
+    def calculate_emissions(self, selections):
+        """Calculate emissions for all selected grid cells and times."""
+        # Initialize results storage
+        results = []
+
+        for selection in selections:
+            crop_mass_kg, residue_mass_kg = self.get_crop_mass(selection['crop'], selection['area'])
+
+            # Calculate base emissions
+            emissions = {}
+            for pollutant in self.finn_data.index:
+                pollutant_data = self.finn_data.loc[pollutant]
+
+                fuel_loading = float(pollutant_data['Fuel_Loading_g_m2'])
+                combustion_completeness = float(pollutant_data['Combustion_Completeness'])
+                emission_factor = float(pollutant_data['Emission_Factor_G_Kg'])
+
+                # Calculate total emissions for this selection
+                total_emission = (fuel_loading * combustion_completeness * emission_factor *
+                                  selection['area'] / 1000)  # Convert to proper units
+
+                emissions[pollutant] = total_emission
+
+            # Store results with metadata
+            results.append({
+                'grid_id': selection['grid_id'],
+                'datetime': selection['datetime'],
+                'emissions': emissions
+            })
+
+        return results
+
+    def aggregate_results(self, results):
+        """Aggregate results by grid cell and day."""
+        # Convert results to DataFrame for easier aggregation
+        rows = []
+        for result in results:
+            row = {
+                'grid_id': result['grid_id'],
+                'date': result['datetime'].date(),
+                **result['emissions']
+            }
+            rows.append(row)
+
+        df = pd.DataFrame(rows)
+
+        # Group by grid_id and date, sum all pollutants
+        aggregated = df.groupby(['grid_id', 'date']).sum().reset_index()
+        return aggregated
+
+    def save_results(self, results, aggregated, output_path):
+        """Save results in SAPRC-99 format."""
+        # Create output directory with timestamp
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_filename = os.path.join(output_path, f'saprc99_emissions_{timestamp}.csv')
+
+        # Convert results to SAPRC-99 format
+        rows = []
+        for result in results:
+            # Get grid cell center coordinates
+            grid_id = str(result['grid_id'])  # Ensure string type
+            matching_cells = self.grid[self.grid['Grid_ID'] == grid_id]
+
+            if matching_cells.empty:
+                print(f"Warning: Grid ID {grid_id} not found in shapefile")
+                continue
+
+            grid_cell = matching_cells.iloc[0]
+            lat = grid_cell.geometry.centroid.y
+            lon = grid_cell.geometry.centroid.x
+
+            # Convert emissions to SAPRC-99 species
+            saprc99_emissions = self.convert_to_saprc99(result['emissions'], result['area'])
+
+            # Create row with all required fields
+            row = {
+                'TIME': result['datetime'].strftime('%Y-%m-%d %H:%M:%S'),
+                'GENVEG': 'CROP',  # Generic vegetation type for agricultural burning
+                'LATI': lat,
+                'LONGI': lon,
+                'AREA': result['area']
+            }
+
+            # Add all SAPRC-99 species
+            row.update(saprc99_emissions)
+
+            rows.append(row)
+
+        # Create DataFrame and save to CSV
+        df = pd.DataFrame(rows)
+
+        # Ensure all SAPRC-99 species are present
+        for species in self.saprc99_species:
+            if species not in df.columns:
+                df[species] = 0.0
+
+        # Reorder columns to match SAPRC-99 format
+        column_order = ['TIME', 'GENVEG', 'LATI', 'LONGI', 'AREA'] + self.saprc99_species
+        df = df[column_order]
+
+        # Save to CSV
+        df.to_csv(output_filename, index=False)
+        print(f"\nResults saved to: {output_filename}")
+
+        # Display summary
+        print("\nSummary of results:")
+        print(f"Total number of entries: {len(df)}")
+        print(f"Date range: {df['TIME'].min()} to {df['TIME'].max()}")
+        print(f"Number of grid cells: {df['LATI'].nunique()}")
+
+    def get_crop_mass(self, crop, area_m2):
+        """Calculate crop and residue mass based on characteristics data."""
+        # Use 'Wheat' as default for missing crops and custom crops
+        char_crop = 'Wheat'
+        prop_crop = 'Wheat'
+
+        # If it's not a custom crop, try to use specific crop data
+        if not crop.startswith('Custom_'):
+            if crop in self.characteristics_data['Crop'].values:
+                char_crop = crop
+            if crop in self.properties_data['Crop'].values:
+                prop_crop = crop
+
+        crop_data = self.characteristics_data[self.characteristics_data['Crop'] == char_crop].iloc[0]
+        properties = self.properties_data[self.properties_data['Crop'] == prop_crop].iloc[0]
+
+        bushel_weight_kg = crop_data['Standard Bushel Weight (lbs/bushel)'] * 0.45359237
+
+        acres_to_m2 = 0.000247105
+        assumed_yield_bushels_per_acre = 50
+        crop_mass_kg = area_m2 * (assumed_yield_bushels_per_acre * bushel_weight_kg) * acres_to_m2
+
+        residue_ratio_str = properties['Residue-to-Seed Ratio']
+        low, high = map(float, residue_ratio_str.split('-'))
+        avg_residue_ratio = (low + high) / 2
+
+        residue_mass_kg = crop_mass_kg * avg_residue_ratio
+        sustainable_rate = properties['Sustainable Removal Rate (%)'] / 100
+        residue_mass_kg *= sustainable_rate
+
+        return crop_mass_kg, residue_mass_kg
+
+    def convert_to_saprc99(self, emissions, area):
+        """
+        Convert basic emissions to SAPRC-99 chemical mechanism species.
+        Based on Carter, W. P. L. Implementation of the SAPRC-99 chemical mechanism into the Models-3 framework; U.S. EPA: 2000.
+
+        Parameters:
+        emissions (dict): Basic emissions dictionary with pollutant keys
+        area (float): Burn area in square meters
+
+        Returns:
+        dict: Emissions converted to SAPRC-99 species
+        """
+        saprc99_emissions = {}
+
+        # Direct mappings for species that don't need conversion
+        direct_map = {
+            'CO2': 'CO2',
+            'CO': 'CO',
+            'NO': 'NO',
+            'NO2': 'NO2',
+            'SO2': 'SO2',
+            'NH3': 'NH3',
+            'CH4': 'CH4',
+            'OC': 'OC',
+            'BC': 'BC',
+            'PM25': 'PM25',
+            'PM10': 'PM10'
+        }
+
+        # Copy over direct mappings
+        for source, target in direct_map.items():
+            if source in emissions:
+                saprc99_emissions[target] = emissions[source]
+            else:
+                saprc99_emissions[target] = 0.0
+
+        # Handle NMOC (Non-methane organic compounds)
+        if 'NMOC' in emissions:
+            total_nmoc = emissions['NMOC']
+            saprc99_emissions['NMOC'] = total_nmoc
+
+            # Table 4 from Carter (2000) provides speciation profiles for agricultural burning (Cropland)
+            # Using exact values from Table 4
+
+            # Calculate total percentage to normalize values
+            total_percentage = (0.83 + 1.22 + 0.31 + 0.02 + 0.03 + 0.02 + 0.95 + 0.06 + 0.01 +
+                                3.05 + 2.19 + 1.09 + 1.84 + 0.33 + 0.90 + 0.09 + 0.60 + 0.54 +
+                                2.11 + 0.00 + 0.19 + 0.14 + 0.54 + 0.16 + 0.60 + 0.11 + 2.08 + 0.00)
+
+            # Exact values from Table 4 for cropland
+            saprc99_emissions['ACET'] = total_nmoc * (0.83 / total_percentage)
+            saprc99_emissions['ALK1'] = total_nmoc * (1.22 / total_percentage)
+            saprc99_emissions['ALK2'] = total_nmoc * (0.31 / total_percentage)
+            saprc99_emissions['ALK3'] = total_nmoc * (0.02 / total_percentage)
+            saprc99_emissions['ALK4'] = total_nmoc * (0.03 / total_percentage)
+            saprc99_emissions['ALK5'] = total_nmoc * (0.02 / total_percentage)
+            saprc99_emissions['ARO1'] = total_nmoc * (0.95 / total_percentage)
+            saprc99_emissions['ARO2'] = total_nmoc * (0.06 / total_percentage)
+            saprc99_emissions['BALD'] = total_nmoc * (0.01 / total_percentage)
+            saprc99_emissions['CCHO'] = total_nmoc * (3.05 / total_percentage)
+            saprc99_emissions['CCO_OH'] = total_nmoc * (2.19 / total_percentage)  # CCO in table is CCO_OH
+            saprc99_emissions['ETHENE'] = total_nmoc * (1.09 / total_percentage)
+            saprc99_emissions['HCHO'] = total_nmoc * (1.84 / total_percentage)
+            saprc99_emissions['HCN'] = total_nmoc * (0.33 / total_percentage)
+            saprc99_emissions['HCOOH'] = total_nmoc * (0.90 / total_percentage)
+            saprc99_emissions['HONO'] = total_nmoc * (0.09 / total_percentage)
+            saprc99_emissions['ISOPRENE'] = total_nmoc * (0.60 / total_percentage)
+            saprc99_emissions['MEK'] = total_nmoc * (0.54 / total_percentage)
+            saprc99_emissions['MEOH'] = total_nmoc * (2.11 / total_percentage)
+            saprc99_emissions['METHACRO'] = total_nmoc * (0.00 / total_percentage)
+            saprc99_emissions['MGLY'] = total_nmoc * (0.19 / total_percentage)
+            saprc99_emissions['MVK'] = total_nmoc * (0.14 / total_percentage)
+            saprc99_emissions['OLE1'] = total_nmoc * (0.54 / total_percentage)
+            saprc99_emissions['OLE2'] = total_nmoc * (0.16 / total_percentage)
+            saprc99_emissions['PHEN'] = total_nmoc * (0.60 / total_percentage)
+            saprc99_emissions['PROD2'] = total_nmoc * (0.11 / total_percentage)
+            saprc99_emissions['RCHO'] = total_nmoc * (2.08 / total_percentage)
+            saprc99_emissions['TRP1'] = total_nmoc * (0.00 / total_percentage)
+
+            # RNO3 is not in the table, using a small default value
+            saprc99_emissions['RNO3'] = total_nmoc * 0.01
+        else:
+            # Set all NMOC species to zero if no NMOC data available
+            for species in [
+                'NMOC', 'ACET', 'ALK1', 'ALK2', 'ALK3', 'ALK4', 'ALK5',
+                'ARO1', 'ARO2', 'BALD', 'CCHO', 'CCO_OH', 'ETHENE',
+                'HCHO', 'HCN', 'HCOOH', 'HONO', 'ISOPRENE', 'MEK',
+                'MEOH', 'METHACRO', 'MGLY', 'MVK', 'OLE1', 'OLE2',
+                'PHEN', 'PROD2', 'RCHO', 'RNO3', 'TRP1'
+            ]:
+                saprc99_emissions[species] = 0.0
+
+        return saprc99_emissions
+
+    def run_model(self):
+        """Run the complete emissions model with grid selection."""
+        # Get user inputs
+        selections = self.get_user_inputs()
+        if not selections:
+            print("No selections made.")
+            return
+
+        # Calculate emissions
+        results = self.calculate_emissions(selections)
+
+        # Aggregate results
+        aggregated = self.aggregate_results(results)
+
+        # Create output directory with timestamp
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_dir = os.path.join(self.data_path, f'emissions_results_{timestamp}')
+        os.makedirs(output_dir, exist_ok=True)
+
+        # Save results
+        self.save_results(results, aggregated, output_dir)
+
+        # Display summary
+        print("\nAggregated Results by Grid Cell and Day:")
+        print(aggregated.to_string())
+        print(f"\nResults saved to: {output_dir}")
+
+
+if __name__ == "__main__":
+    data_path = r"E:\CARB\Python_Scripts_and_Data\Pollutant_Estimates"
+    grid_path = r"E:\CARB\Python_Scripts_and_Data\Pollutant_Estimates\Mexicali_Grid_files"
+    model = GriddedEmissionsModel(data_path, grid_path)
+    model.run_model()
